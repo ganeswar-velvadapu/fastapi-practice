@@ -1,10 +1,39 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,Response,Request,Depends
 import psycopg2
 from pydantic import BaseModel
-
+from passlib.context import CryptContext
+import jwt
+from datetime import datetime,timedelta
+from fastapi.security import OAuth2PasswordBearer
 
 
 app = FastAPI()
+
+oauth_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def check_token(token:str = Depends(oauth_scheme)):
+    if not token:
+        raise HTTPException(status_code=404,detail="Unauthorized")
+    try:
+        decode = jwt.decode(token,"secret","HS256")
+        username = decode.get("sub")
+    except Exception as e:
+        raise HTTPException(status_code=500,detail="Invalid token")
+    return username
+
+
+
+
+
+def create_token(username)-> str:
+    payload = {
+        "sub" : username,
+        "exp" : datetime.utcnow() + timedelta(minutes = 1)
+    }
+    token = jwt.encode(payload,"secret","HS256")
+    return token
+
+pwd_context = CryptContext(schemes=["bcrypt"],deprecated="auto")
 
 def db_connect():
     conn = psycopg2.connect(
@@ -22,12 +51,17 @@ class Post(BaseModel):
     author : str
 
 
+class User(BaseModel):
+    username : str
+    email : str
+    password : str
+
 @app.get("/")
 def test():
     return {"message" : "Test"}
 
-
-@app.get("/all-posts")
+#Post routes
+@app.get("/all-posts", tags=["posts"])
 def all_posts():
     conn = db_connect()
     try:
@@ -56,8 +90,8 @@ def all_posts():
     finally:
         conn.close()
 
-@app.post("/new-post")
-def new_post(post : Post):
+@app.post("/new-post",tags=["posts"])
+def new_post(post : Post,current_user = Depends(check_token)):
     conn = db_connect()
     try:
         with conn.cursor() as cur:
@@ -79,9 +113,11 @@ def new_post(post : Post):
                 """,
                 (post.title,post.content,post.author)
             )
+            new_id = cur.fetchone()[0]
             conn.commit()
             return {
-                "message" : "Post created"
+                "message" : "Post created",
+                "id" : new_id
             }
     except Exception as e:
         conn.rollback()
@@ -89,8 +125,8 @@ def new_post(post : Post):
     finally:
         conn.close()
 
-@app.post("/update-post/{id}")
-def update_post(updated_post : Post,id:int):
+@app.post("/update-post/{id}",tags=["posts"])
+def update_post(updated_post : Post,id:int,current_user = Depends(check_token)):
     conn = db_connect()
     try:
         with conn.cursor() as cur:
@@ -119,19 +155,104 @@ def update_post(updated_post : Post,id:int):
     finally:
         conn.close()
 
-@app.delete("/delete-post")
-def delete_post():
+@app.delete("/delete-post/{id}",tags=["posts"])
+def delete_post(id : int,current_user = Depends(check_token)):
+
     conn = db_connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                
+                DELETE FROM posts
+                WHERE id = %s
+                RETURNING ID
+                """,
+                (id,)
+            )
+            deleted_id = cur.fetchone()[0]
+            if not deleted_id:
+                raise HTTPException(status_code=404,detail="Post not found")
+            cur.execute("SELECT COUNT(*) FROM posts")
+            count = cur.fetchone()[0]
+            if count == 0:
+                cur.execute("ALTER SEQUENCE posts_id_seq RESTART WITH 1")
+                conn.commit()
+            conn.commit()
+            return {
+                "message" : f"Post with id {id} removed"
+            }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500,detail="Internal Server Error")
+    finally:
+        conn.close()
+
+#User routes
+@app.post("/signup",tags=["users"])
+def signup(user : User,response:Response):
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users(
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(255) UNIQUE,
+                email VARCHAR(255) UNIQUE,
+                password VARCHAR(255)
+                )
                 """
             )
+            hash_password = pwd_context.hash(user.password)
+            cur.execute(
+                """
+                INSERT INTO users(username,email,password)
+                VALUES (%s,%s,%s)
+                RETURNING id
+                """,
+                (user.username,user.email,hash_password)
+            )
+            conn.commit()
+            token = create_token(user.username)
+            response.set_cookie(key="token",value=f"{token}",httponly=True)
+            return {
+                "message" : "Signup successful"
+            }
 
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500,detail="Internal Server Error")
     finally:
         conn.close()
+
+@app.post("/login",tags=['users'])
+def login(email:str,password:str,response:Response):
+    conn = db_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT username,email,password FROM users WHERE email = %s
+                """,
+                (email,)
+            )
+            user = cur.fetchone()
+            if user is None:
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            db_username,db_email,db_password = user
+            password_check = pwd_context.verify(password,db_password)
+            if not password_check:
+                raise HTTPException(status_code=404,detail="Wrong Password")
+            token = create_token(db_username)
+            print(token)
+            response.set_cookie(key="token",value=f"{token}",httponly=True)
+            return {
+                "message" : "login successful"
+            }
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500,detail="Internal Server error")
+    finally:
+        conn.close()
+
